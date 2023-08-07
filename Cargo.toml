@@ -9,5 +9,6 @@ edition = "2021"
 anyhow = "1.0.72"
 enum-iterator = "1.4.1"
 hidapi = { version = "2.4.1", features = ["macos-shared-device"] }
+retry = "2.0.0"
 tracing = "0.1.37"
-tracing-subscriber = "0.3.17"
+tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }

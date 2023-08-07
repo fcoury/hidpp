@@ -2,42 +2,37 @@
 
 use std::collections::HashMap;
 
+use anyhow::{anyhow, bail};
 use enum_iterator::{all, Sequence};
+use retry::{delay::Fixed, retry, retry_with_index, OperationResult};
+use tracing::Level;
+use tracing_subscriber::{EnvFilter, FmtSubscriber};
+
 fn main() {
-    let device = Device::new(0x046d, 0xc547).unwrap();
-    let mut features_index = HashMap::from([(Feature::IRoot, 0x00u8)]);
-    for feature in all::<Feature>().collect::<Vec<_>>() {
-        let request = MessageBuilder::new_short(
-            *features_index.get(&Feature::IRoot).unwrap(),
-            Function::GetFeature,
+    let subscriber = FmtSubscriber::builder()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .or_else(|_| EnvFilter::try_new("info"))
+                .unwrap(),
         )
-        .device_index(0x01)
-        .add_u16(feature.value())
-        .build();
-        println!("REQ {:?}: {}", feature, request.dump());
-        let response = request.send(&device).unwrap();
-        println!("RES {:?}: {}", feature, response.dump());
-        features_index.insert(feature, response.data[0]);
-        println!();
-    }
-    // let request = MessageBuilder::new_short(
-    //     *features_index.get(&Feature::IRoot).unwrap(),
-    //     Function::GetFeature,
-    // )
-    // .device_index(0x01)
-    // .add_u16(Feature::IFeatureSet.value())
-    // .build();
-    // println!("{}", request.dump());
-    // let response = request.send(&device).unwrap();
-    // println!("{}", response.dump());
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+
+    let mut device = Device::new(0x046d, 0xc547).unwrap();
+    device.init();
+
+    let battery = device.get_battery_level().unwrap();
+    println!("Battery: {}%", battery);
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Sequence)]
 enum Feature {
-    IRoot,
-    IFeatureSet,
-    IFirmwareInfo,
-    GetDeviceNameType,
+    Root,
+    FeatureSet,
+    FeatureInfo,
+    FirmwareInfo,
+    DeviceUnitId,
+    DeviceNameType,
     BatteryLevelStatus,
     UnifiedBattery,
 }
@@ -45,10 +40,12 @@ enum Feature {
 impl Feature {
     fn value(&self) -> u16 {
         match self {
-            Feature::IRoot { .. } => 0x0000,
-            Feature::IFeatureSet => 0x0001,
-            Feature::IFirmwareInfo => 0x0003,
-            Feature::GetDeviceNameType => 0x0005,
+            Feature::Root { .. } => 0x0000,
+            Feature::FeatureSet => 0x0001,
+            Feature::FeatureInfo => 0x0002,
+            Feature::FirmwareInfo => 0x0003,
+            Feature::DeviceUnitId => 0x0004,
+            Feature::DeviceNameType => 0x0005,
             Feature::BatteryLevelStatus => 0x1000,
             Feature::UnifiedBattery => 0x1004,
         }
@@ -56,15 +53,19 @@ impl Feature {
 }
 
 enum Function {
-    GetFeature,
-    GetProtocolVersion,
+    RootGetFeature,
+    RootGetProtocolVersion,
+    UnifiedBatteryGetCapabilities,
+    UnifiedBatteryGetStatus,
 }
 
 impl Function {
     fn value(&self) -> u8 {
         match self {
-            Function::GetFeature => 0x00,
-            Function::GetProtocolVersion => 0x01,
+            Function::RootGetFeature => 0x00,
+            Function::RootGetProtocolVersion => 0x01,
+            Function::UnifiedBatteryGetCapabilities => 0x00,
+            Function::UnifiedBatteryGetStatus => 0x01,
         }
     }
 }
@@ -110,7 +111,7 @@ struct Message {
 }
 
 impl Message {
-    pub fn send(&self, device: &Device) -> anyhow::Result<Message> {
+    pub fn send(&self, device: &mut Device) -> anyhow::Result<Message> {
         let mut buf = vec![
             self.report_id.to_u8(),
             self.device_index,
@@ -126,17 +127,8 @@ impl Message {
                 .take(7),
         );
 
-        match device.device.write(&buf).map_err(|e| e.to_string()) {
-            Ok(_) => {}
-            Err(e) => {
-                println!("Error writing to device: {}", e);
-            }
-        }
-
-        let mut buf = [0u8; 7];
-        let res = device.device.read_timeout(&mut buf, 1000)?;
-
-        Ok(Message::from(buf.to_vec()))
+        let buf = device.write(&buf)?;
+        Message::try_from(buf.to_vec())
     }
 
     pub fn dump(&self) -> String {
@@ -148,21 +140,23 @@ impl Message {
     }
 }
 
-impl From<Vec<u8>> for Message {
-    fn from(buf: Vec<u8>) -> Self {
-        Self {
+impl TryFrom<Vec<u8>> for Message {
+    type Error = anyhow::Error;
+
+    fn try_from(buf: Vec<u8>) -> anyhow::Result<Self> {
+        Ok(Self {
             report_id: match buf[0] {
                 0x10 => ReportId::Short,
                 0x11 => ReportId::Long,
                 0x12 => ReportId::VeryLong,
-                id => panic!("Invalid report id: 0x{:X}", id),
+                id => bail!("Invalid report id: 0x{:X}", id),
             },
             device_index: buf[1],
             feature_index: buf[2],
             function_index: buf[3] >> 4,
             software_id: buf[3] & 0x0F,
             data: buf[4..].to_vec(),
-        }
+        })
     }
 }
 
@@ -243,17 +237,134 @@ impl MessageBuilder {
 }
 
 struct Device {
+    vendor_id: u16,
+    product_id: u16,
     device: hidapi::HidDevice,
+    features_index: HashMap<Feature, u8>,
 }
 
 impl Device {
-    pub fn new(vid: u16, pid: u16) -> anyhow::Result<Self> {
-        let device = hidapi::HidApi::new()
-            .unwrap()
-            .open(vid, pid)
-            .expect("Failed to open device");
+    fn open(vendor_id: u16, product_id: u16) -> anyhow::Result<hidapi::HidDevice> {
+        retry_with_index(
+            Fixed::from_millis(10),
+            |attempt| match hidapi::HidApi::new().unwrap().open(vendor_id, product_id) {
+                Ok(device) => OperationResult::Ok(device),
+                Err(err) => {
+                    if attempt > 5 {
+                        tracing::debug!("Giving up opening device: {}", err);
+                        return OperationResult::Err(format!("Error opening device: {}", err));
+                    }
+                    tracing::debug!("Error opening device: {}", err);
+                    OperationResult::Retry(format!("Error opening device: {}", err))
+                }
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to open device: {}", e))
+    }
 
-        Ok(Device { device })
+    pub fn new(vendor_id: u16, product_id: u16) -> anyhow::Result<Self> {
+        let device = Device::open(vendor_id, product_id)?;
+
+        Ok(Device {
+            vendor_id,
+            product_id,
+            device,
+            features_index: HashMap::new(),
+        })
+    }
+
+    pub fn reconnect(&mut self) -> anyhow::Result<()> {
+        self.device = Device::open(self.vendor_id, self.product_id)?;
+        Ok(())
+    }
+
+    pub fn init(&mut self) {
+        let mut features_index = HashMap::from([(Feature::Root, 0x00u8)]);
+        for feature in all::<Feature>().collect::<Vec<_>>() {
+            let feature_index = self.get_feature_index(feature.clone()).unwrap();
+            features_index.insert(feature, feature_index);
+        }
+
+        tracing::debug!("{:#?}", features_index);
+        self.features_index = features_index;
+    }
+
+    pub fn write(&mut self, buf: &[u8]) -> anyhow::Result<Vec<u8>> {
+        retry_with_index(
+            Fixed::from_millis(1),
+            |attempt| -> OperationResult<Vec<u8>, String> {
+                match self.device.write(buf) {
+                    Ok(_) => OperationResult::Ok(vec![]),
+                    Err(e) => {
+                        if attempt > 5 {
+                            return OperationResult::Err(format!("Error writing to device: {}", e));
+                        }
+                        tracing::debug!("Error writing to device: {}", e);
+                        self.reconnect();
+                        OperationResult::Retry(format!("Error writing to device: {}", e))
+                    }
+                }
+            },
+        )
+        .expect("Failed to write to device");
+        tracing::trace!("Done writing");
+
+        let mut buf = [0u8; 7];
+        self.device.read_timeout(&mut buf, 100)?;
+        Ok(buf.to_vec())
+    }
+
+    pub fn get_feature_index(&mut self, feature: Feature) -> anyhow::Result<u8> {
+        let request = MessageBuilder::new_short(0x00, Function::RootGetFeature)
+            .device_index(0x01)
+            .add_u16(feature.value())
+            .build();
+        tracing::debug!("REQ {:?}: {}", feature, request.dump());
+        let response = request.send(self).unwrap();
+        tracing::debug!("RES {:?}: {}", feature, response.dump());
+        tracing::debug!("");
+        Ok(response.data[0])
+    }
+
+    pub fn index_for(&self, feature: Feature) -> anyhow::Result<u8> {
+        self.features_index
+            .get(&feature)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("Feature {:?} not found", feature))
+    }
+
+    pub fn send_feature(
+        &mut self,
+        feature: Feature,
+        function: Function,
+        payload: &[u8],
+    ) -> anyhow::Result<Message> {
+        let request = MessageBuilder::new_short(self.index_for(feature.clone())?, function)
+            .device_index(0x01)
+            .data(payload.to_vec())
+            .build();
+        tracing::debug!("REQ {:?}: {}", feature, request.dump());
+        let response = request.send(self).unwrap();
+        tracing::debug!("RES {:?}: {}", feature, response.dump());
+        tracing::debug!("");
+        Ok(response)
+    }
+
+    pub fn get_battery_level(&mut self) -> anyhow::Result<u8> {
+        let result = self.send_feature(
+            Feature::UnifiedBattery,
+            Function::UnifiedBatteryGetCapabilities,
+            &[],
+        )?;
+        tracing::debug!("Capabilities: {}", result.dump());
+
+        let result = self.send_feature(
+            Feature::UnifiedBattery,
+            Function::UnifiedBatteryGetStatus,
+            &[],
+        )?;
+        tracing::debug!("Battery level: {}", result.dump());
+        Ok(result.data[0])
     }
 }
 
