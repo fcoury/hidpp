@@ -7,4 +7,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.72"
+enum-iterator = "1.4.1"
 hidapi = { version = "2.4.1", features = ["macos-shared-device"] }
+tracing = "0.1.37"
+tracing-subscriber = "0.3.17"
