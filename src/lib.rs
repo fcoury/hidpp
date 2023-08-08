@@ -3,29 +3,9 @@ use std::collections::HashMap;
 use anyhow::bail;
 use enum_iterator::{all, Sequence};
 use retry::{delay::Fixed, retry_with_index, OperationResult};
-use tracing_subscriber::{EnvFilter, FmtSubscriber};
-
-fn main() {
-    let subscriber = FmtSubscriber::builder()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .or_else(|_| EnvFilter::try_new("info"))
-                .unwrap(),
-        )
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
-
-    let mut device = Device::new(0x046d, 0xc547).unwrap();
-    device.init();
-
-    let (percentage, level, status) = device.get_battery().unwrap();
-    println!("Battery: {}%", percentage);
-    println!("Level: {:?}", level);
-    println!("Status: {:?}", status);
-}
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Sequence)]
-enum Feature {
+pub enum Feature {
     Root,
     FeatureSet,
     FeatureInfo,
@@ -52,7 +32,7 @@ impl Feature {
 }
 
 #[allow(unused)]
-enum Function {
+pub enum Function {
     RootGetFeature,
     RootGetProtocolVersion,
     UnifiedBatteryGetCapabilities,
@@ -71,7 +51,7 @@ impl Function {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-enum BatteryStatus {
+pub enum BatteryStatus {
     Discharging,
     Recharging,
     AlmostFull,
@@ -99,7 +79,7 @@ impl TryFrom<u8> for BatteryStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-enum BatteryLevel {
+pub enum BatteryLevel {
     Full,
     Good,
     Low,
@@ -123,7 +103,7 @@ impl TryFrom<u8> for BatteryLevel {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-enum ReportId {
+pub enum ReportId {
     Short,
     Long,
     VeryLong,
@@ -145,7 +125,7 @@ impl ReportId {
 // 00 = feature_index
 // 10 = function_index (0x01 = ping) and software_id (0x00 = unknown)
 // 00 00 AA = data
-struct Message {
+pub struct Message {
     // byte 0 - the report id (Short, Long or VeryLong)
     report_id: ReportId,
     // byte 1 - 0xff until the device is known, then the device index
@@ -212,7 +192,7 @@ impl TryFrom<Vec<u8>> for Message {
     }
 }
 
-struct MessageBuilder {
+pub struct MessageBuilder {
     report_id: ReportId,
     device_index: u8,
     feature_index: u8,
@@ -289,7 +269,7 @@ impl MessageBuilder {
     }
 }
 
-struct Device {
+pub struct Device {
     vendor_id: u16,
     product_id: u16,
     device: hidapi::HidDevice,
