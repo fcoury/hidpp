@@ -1,4 +1,4 @@
-use luigi::Device;
+use hidpp::Device;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 fn main() {
