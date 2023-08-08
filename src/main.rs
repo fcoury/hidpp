@@ -1,11 +1,8 @@
-#![allow(unused)]
-
 use std::collections::HashMap;
 
-use anyhow::{anyhow, bail};
+use anyhow::bail;
 use enum_iterator::{all, Sequence};
-use retry::{delay::Fixed, retry, retry_with_index, OperationResult};
-use tracing::Level;
+use retry::{delay::Fixed, retry_with_index, OperationResult};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 fn main() {
@@ -21,8 +18,10 @@ fn main() {
     let mut device = Device::new(0x046d, 0xc547).unwrap();
     device.init();
 
-    let battery = device.get_battery_level().unwrap();
-    println!("Battery: {}%", battery);
+    let (percentage, level, status) = device.get_battery().unwrap();
+    println!("Battery: {}%", percentage);
+    println!("Level: {:?}", level);
+    println!("Status: {:?}", status);
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Sequence)]
@@ -52,6 +51,7 @@ impl Feature {
     }
 }
 
+#[allow(unused)]
 enum Function {
     RootGetFeature,
     RootGetProtocolVersion,
@@ -66,6 +66,58 @@ impl Function {
             Function::RootGetProtocolVersion => 0x01,
             Function::UnifiedBatteryGetCapabilities => 0x00,
             Function::UnifiedBatteryGetStatus => 0x01,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+enum BatteryStatus {
+    Discharging,
+    Recharging,
+    AlmostFull,
+    Full,
+    SlowRecharge,
+    InvalidBattery,
+    ThermalError,
+}
+
+impl TryFrom<u8> for BatteryStatus {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u8) -> anyhow::Result<Self> {
+        match value {
+            0x00 => Ok(BatteryStatus::Discharging),
+            0x01 => Ok(BatteryStatus::Recharging),
+            0x02 => Ok(BatteryStatus::AlmostFull),
+            0x03 => Ok(BatteryStatus::Full),
+            0x04 => Ok(BatteryStatus::SlowRecharge),
+            0x05 => Ok(BatteryStatus::InvalidBattery),
+            0x06 => Ok(BatteryStatus::ThermalError),
+            _ => bail!("Invalid battery status: 0x{:X}", value),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+enum BatteryLevel {
+    Full,
+    Good,
+    Low,
+    Critical,
+    Empty,
+}
+
+impl TryFrom<u8> for BatteryLevel {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u8) -> anyhow::Result<Self> {
+        match value {
+            0 => Ok(BatteryLevel::Empty),
+            1 => Ok(BatteryLevel::Critical),
+            2..=3 => Ok(BatteryLevel::Low),
+            4..=7 => Ok(BatteryLevel::Good),
+            8 => Ok(BatteryLevel::Full),
+            _ => bail!("Invalid battery level: 0x{:X}", value),
         }
     }
 }
@@ -169,6 +221,7 @@ struct MessageBuilder {
     data: Vec<u8>,
 }
 
+#[allow(unused)]
 impl MessageBuilder {
     pub fn new_short(feature_index: u8, function: Function) -> Self {
         Self {
@@ -300,7 +353,7 @@ impl Device {
                             return OperationResult::Err(format!("Error writing to device: {}", e));
                         }
                         tracing::debug!("Error writing to device: {}", e);
-                        self.reconnect();
+                        self.reconnect().unwrap();
                         OperationResult::Retry(format!("Error writing to device: {}", e))
                     }
                 }
@@ -350,13 +403,19 @@ impl Device {
         Ok(response)
     }
 
-    pub fn get_battery_level(&mut self) -> anyhow::Result<u8> {
-        let result = self.send_feature(
-            Feature::UnifiedBattery,
-            Function::UnifiedBatteryGetCapabilities,
-            &[],
-        )?;
-        tracing::debug!("Capabilities: {}", result.dump());
+    pub fn get_battery(&mut self) -> anyhow::Result<(u8, BatteryLevel, BatteryStatus)> {
+        // let result = self.send_feature(
+        //     Feature::UnifiedBattery,
+        //     Function::UnifiedBatteryGetCapabilities,
+        //     &[],
+        // )?;
+        // tracing::info!("Capabilities: {}", result.dump());
+        // let capabilities = result.data[0];
+        // if capabilities & Capabilities::BATTERY_LEVEL_STATUS {
+        //     tracing::info!("Battery level status supported");
+        // } else {
+        //     tracing::info!("Battery level status not supported");
+        // }
 
         let result = self.send_feature(
             Feature::UnifiedBattery,
@@ -364,7 +423,12 @@ impl Device {
             &[],
         )?;
         tracing::debug!("Battery level: {}", result.dump());
-        Ok(result.data[0])
+
+        Ok((
+            result.data[0],
+            BatteryLevel::try_from(result.data[1])?,
+            BatteryStatus::try_from(result.data[2])?,
+        ))
     }
 }
 
